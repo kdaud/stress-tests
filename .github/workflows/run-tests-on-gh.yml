@@ -1,0 +1,125 @@
+name: Run Performance Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      test-changes: ${{ steps.changes.outputs.test-sources }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Check if any source code has changed
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            test-sources:
+              - 'src/**/*' 
+              - '.github/workflows/run-tests-on-gh.yml'
+              - 'pom.xml'
+              - 'commit-report.sh'
+
+  build-and-test:
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.test-changes == 'true' }}
+
+    runs-on: ubuntu-latest
+    env:
+      SIMULATION_PRESET: standard
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update the load configuration for PRS
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "SIMULATION_PRESET=pull_request" >> $GITHUB_ENV
+
+      - name: Update the load configuration for commits
+        if: github.event_name == 'push'
+        run: |
+          echo "SIMULATION_PRESET=commit" >> $GITHUB_ENV
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'adopt'
+          java-version: '17'
+
+      - name: Install dependencies
+        run: ./mvnw install -DskipTests
+
+      - name: Get System Information
+        run: |
+          # Get RAM information
+          total_ram=$(free -h | grep Mem | awk '{print $2}')
+          
+          # Get number of CPUs
+          num_cpus=$(nproc)
+          
+          # Get disk space information
+          total_disk=$(df -h / | grep / | awk '{print $2}')
+          
+          # Format the description
+          description="Executed on a GitHub Actions runner with ${total_ram} RAM, ${num_cpus}CPUs, and ${total_disk} disk space."
+          
+          # Set the description as an environment variable
+          echo "GATLING_RUN_DESCRIPTION=${description}" >> $GITHUB_ENV
+
+      - name: Run performance tests
+        run: ./mvnw gatling:test -Dgatling.runDescription="${{ env.GATLING_RUN_DESCRIPTION }}"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: target/gatling
+          retention-days: 30
+
+      # Publish the report to GH pages
+      - name: Set up Git
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit the report to the report branch
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: |
+          chmod +x commit-report.sh
+          ./commit-report.sh
+
+      - name: Push changes
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: |
+          git push origin main:report -f
+
+      - name: Capture Server Logs
+        if: always()
+        uses: jwalton/gh-docker-logs@v2
+        with:
+          dest: './logs'
+
+      - name: Upload Logs as Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: server-logs
+          path: './logs'
+          retention-days: 2
+          overwrite: true
